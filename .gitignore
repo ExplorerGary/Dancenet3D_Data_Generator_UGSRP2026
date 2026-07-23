@@ -1,0 +1,17 @@
+# Ignore everything by default (HPC / repo should only ship processing scripts)
+*
+
+# Keep ignore / attributes
+!.gitignore
+!.gitattributes
+
+# Data processing scripts
+!generate_gsplat_dataset.py
+!generate_dlapis_dataset.py
+!video_to_images.py
+!verify_colmap_bin.py
+
+# Project metadata needed to run / document the scripts
+!requirements.txt
+!README.md
+!LICENSE
