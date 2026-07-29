@@ -36,6 +36,7 @@ Output structure:
 """
 
 import argparse
+import hashlib
 import json
 import shutil
 import struct
@@ -43,6 +44,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -60,6 +62,67 @@ def format_duration(seconds: float) -> str:
         return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
 
 
+GENERATION_MARKER = ".generation_complete.json"
+
+
+def _nonempty_file(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _valid_image_file(path: Path, channels: Optional[int] = None) -> bool:
+    """Return True only when OpenCV can decode a non-empty image."""
+    if not _nonempty_file(path):
+        return False
+    import cv2
+
+    image = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+    if image is None:
+        return False
+    if channels is None:
+        return True
+    actual_channels = 1 if image.ndim == 2 else image.shape[2]
+    return actual_channels == channels
+
+
+def _atomic_imwrite(path: Path, image) -> bool:
+    """Write an image atomically so interrupted writes are never resumable outputs."""
+    import cv2
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_name(
+        f".{path.stem}.{os.getpid()}.{threading.get_ident()}.tmp{path.suffix}"
+    )
+    try:
+        if not cv2.imwrite(str(temp_path), image):
+            return False
+        os.replace(temp_path, path)
+        return True
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def camera_decode_outputs_complete(
+    output_base: Path,
+    camera_id: str,
+    frame_ids: list[str],
+    content_type: str,
+    image_extension: str,
+) -> bool:
+    """Check whether each frame already has a final or decoded camera image."""
+    for frame_id in frame_ids:
+        frame_dir = output_base / frame_id
+        final_path = frame_dir / "images" / f"{camera_id}{image_extension}"
+        mask_path = frame_dir / "masks" / f"{camera_id}{image_extension}"
+        decoded_path = frame_dir / content_type / f"{camera_id}{image_extension}"
+        final_ready = _nonempty_file(final_path) and _nonempty_file(mask_path)
+        if not (final_ready or _nonempty_file(decoded_path)):
+            return False
+    return True
+
+
 def decode_camera_video(
     video_path: Path,
     output_base: Path,
@@ -68,6 +131,7 @@ def decode_camera_video(
     content_type: str,
     image_extension: str,
     verbose: bool = False,
+    resume: bool = False,
 ) -> tuple[bool, float]:
 
     start_time = time.time()
@@ -107,6 +171,13 @@ def decode_camera_video(
             dest_dir = output_base / frame_id / content_type
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest_frame = dest_dir / f"{camera_id}{image_extension}"
+
+            if resume:
+                final_frame = output_base / frame_id / "images" / f"{camera_id}{image_extension}"
+                if _nonempty_file(final_frame) or _nonempty_file(dest_frame):
+                    # FFmpeg still decodes sequentially, but keep work from an
+                    # interrupted invocation instead of overwriting it.
+                    continue
 
             if src_frame.exists():
                 # Move original to images_no_lut/ (intermediate; removed after masking)
@@ -476,24 +547,29 @@ def apply_masked_images(
     image_extension: str,
     lut_map: Optional[dict] = None,
     verbose: bool = False,
+    workers: int = 1,
+    resume: bool = False,
 ) -> bool:
     """Composite LUT-corrected images with masks into RGBA PNGs in images/.
 
     masks/ keeps the corresponding B&W foreground masks (255 = dancer).
     Dancer pixels (mask >= 128) keep their LUT color with alpha=255.
     Background pixels are set to RGB(0,0,0) with alpha=0.
+
+    OpenCV and NumPy release the GIL for the expensive operations here, so a
+    thread pool accelerates LUT processing while sharing the LUT arrays in RAM.
     """
     import cv2
     from tqdm import tqdm
 
-    count = 0
+    created = 0
+    skipped = 0
     missing = 0
     tasks = [(frame_id, camera_id) for frame_id in frame_ids for camera_id in cameras]
     progress_desc = "LUT + mask" if lut_map else "Mask"
-    progress = tqdm(tasks, desc=f"  {progress_desc}", unit="img")
 
-    for frame_id, camera_id in progress:
-        progress.set_postfix(frame=frame_id, cam=camera_id, refresh=False)
+    def process_task(task: tuple[str, str]) -> tuple[str, str, str, Optional[str]]:
+        frame_id, camera_id = task
         frame_dir = output_base / frame_id
         image_dir = frame_dir / "images_no_lut"
         mask_dir = frame_dir / "masks"
@@ -504,29 +580,29 @@ def apply_masked_images(
         mask_path = mask_dir / f"{camera_id}{image_extension}"
         out_path = out_dir / f"{camera_id}{image_extension}"
 
-        if not image_path.exists():
-            missing += 1
-            if verbose:
-                print(f"  Warning: Image not found: {image_path}", file=sys.stderr)
-            continue
-        if not mask_path.exists():
-            missing += 1
-            if verbose:
-                print(f"  Warning: Mask not found: {mask_path}", file=sys.stderr)
-            continue
+        if (
+            resume
+            and _valid_image_file(out_path, channels=4)
+            and _valid_image_file(mask_path, channels=1)
+        ):
+            return "skipped", frame_id, camera_id, None
 
         img_bgr = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
         mask_raw = cv2.imread(str(mask_path), cv2.IMREAD_UNCHANGED)
-        if img_bgr is None or mask_raw is None:
-            missing += 1
-            continue
+        if img_bgr is None:
+            image_path.unlink(missing_ok=True)
+            return "missing", frame_id, camera_id, f"Image not found or invalid: {image_path}"
+        if mask_raw is None:
+            mask_path.unlink(missing_ok=True)
+            return "missing", frame_id, camera_id, f"Mask not found or invalid: {mask_path}"
 
         if mask_raw.ndim == 3:
             mask = mask_raw[:, :, 0]
         else:
             mask = mask_raw
         bw_mask = np.where(mask >= 128, 255, 0).astype(np.uint8)
-        cv2.imwrite(str(mask_path), bw_mask)
+        if not _atomic_imwrite(mask_path, bw_mask):
+            return "missing", frame_id, camera_id, f"Failed to write mask: {mask_path}"
 
         lut_info = lut_map.get(camera_id) if lut_map else None
         if lut_info is not None:
@@ -539,15 +615,50 @@ def apply_masked_images(
         bgra = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2BGRA)
         bgra[~foreground] = 0
         bgra[:, :, 3] = alpha
-        cv2.imwrite(str(out_path), bgra)
-        count += 1
+        if not _atomic_imwrite(out_path, bgra):
+            return "missing", frame_id, camera_id, f"Failed to write image: {out_path}"
+        return "created", frame_id, camera_id, None
 
-    if count == 0:
+    def record_result(result: tuple[str, str, str, Optional[str]], progress) -> None:
+        nonlocal created, skipped, missing
+        status, frame_id, camera_id, detail = result
+        progress.set_postfix(frame=frame_id, cam=camera_id, refresh=False)
+        if status == "created":
+            created += 1
+        elif status == "skipped":
+            skipped += 1
+        else:
+            missing += 1
+            if verbose and detail:
+                tqdm.write(f"  Warning: {detail}", file=sys.stderr)
+
+    progress = tqdm(total=len(tasks), desc=f"  {progress_desc}", unit="img")
+    try:
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(process_task, task) for task in tasks]
+                for future in as_completed(futures):
+                    try:
+                        record_result(future.result(), progress)
+                    except Exception as exc:
+                        missing += 1
+                        if verbose:
+                            tqdm.write(f"  Warning: LUT worker failed: {exc}", file=sys.stderr)
+                    progress.update(1)
+        else:
+            for task in tasks:
+                record_result(process_task(task), progress)
+                progress.update(1)
+    finally:
+        progress.close()
+
+    if created + skipped == 0:
         print("  Warning: No masked images created (missing images or masks)", file=sys.stderr)
         return False
 
-    if verbose and missing:
-        print(f"  Skipped {missing} image/mask pairs")
+    print(f"  Masked images: {created} created, {skipped} resumed, {missing} missing/failed")
+    if missing:
+        return False
 
     return True
 
@@ -672,6 +783,89 @@ def get_sequence_res_dir(output_path: Path, sequence_name: str, scale: int) -> P
     return output_path / "DanceNet3D" / sequence_name / f"{sequence_name}_res{scale}"
 
 
+def generation_config(
+    sequence_name: str,
+    frame_ids: list[str],
+    cameras: list[str],
+    image_extension: str,
+    lut_map: Optional[dict],
+) -> dict:
+    lut_digest = None
+    if lut_map:
+        digest = hashlib.sha256()
+        for camera_id in sorted(lut_map):
+            lut_info = lut_map[camera_id]
+            digest.update(camera_id.encode("utf-8"))
+            digest.update(str(lut_info["size"]).encode("ascii"))
+            for key in ("domain_min", "domain_max", "lut"):
+                digest.update(np.asarray(lut_info[key]).tobytes())
+        lut_digest = digest.hexdigest()
+
+    return {
+        "schema_version": 1,
+        "sequence": sequence_name,
+        "frame_ids": list(frame_ids),
+        "cameras": list(cameras),
+        "image_extension": image_extension,
+        "lut_enabled": lut_map is not None,
+        "lut_sha256": lut_digest,
+    }
+
+
+def generation_marker_matches(sequence_output: Path, config: dict) -> bool:
+    marker_path = sequence_output / GENERATION_MARKER
+    try:
+        with marker_path.open("r", encoding="utf-8") as handle:
+            marker = json.load(handle)
+        return all(marker.get(key) == value for key, value in config.items())
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def write_generation_marker(sequence_output: Path, config: dict) -> None:
+    marker_path = sequence_output / GENERATION_MARKER
+    temp_path = marker_path.with_name(
+        f".{marker_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    payload = {**config, "completed_at_unix": time.time()}
+    try:
+        sequence_output.mkdir(parents=True, exist_ok=True)
+        with temp_path.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+            handle.write("\n")
+        os.replace(temp_path, marker_path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def sequence_outputs_complete(
+    sequence_output: Path,
+    frame_ids: list[str],
+    cameras: list[str],
+    image_extension: str,
+    has_colmap: bool,
+) -> tuple[bool, Optional[str]]:
+    """Cheap structural completeness check used before cleanup and fast skips."""
+    for frame_id in frame_ids:
+        frame_dir = sequence_output / frame_id
+        for camera_id in cameras:
+            image_path = frame_dir / "images" / f"{camera_id}{image_extension}"
+            mask_path = frame_dir / "masks" / f"{camera_id}{image_extension}"
+            if not _nonempty_file(image_path):
+                return False, f"missing image: {image_path}"
+            if not _nonempty_file(mask_path):
+                return False, f"missing mask: {mask_path}"
+
+        if has_colmap:
+            sparse_dir = frame_dir / "sparse" / "0"
+            for filename in ("cameras.bin", "images.bin"):
+                sparse_path = sparse_dir / filename
+                if not _nonempty_file(sparse_path):
+                    return False, f"missing COLMAP file: {sparse_path}"
+
+    return True, None
+
+
 def process_sequence(
     input_path: Path,
     output_path: Path,
@@ -682,6 +876,9 @@ def process_sequence(
     verbose: bool,
     lut_map: Optional[dict] = None,
     max_frames: Optional[int] = None,
+    lut_workers: int = 1,
+    resume: bool = False,
+    skip_completed: bool = False,
 ) -> bool:
 
     sequence_input = input_path / sequence_name
@@ -705,6 +902,24 @@ def process_sequence(
         print(f"  No cameras to decode for {sequence_name}")
         return False
 
+    config = generation_config(
+        sequence_name, frame_ids, cameras, image_extension, lut_map
+    )
+    marker_path = sequence_output / GENERATION_MARKER
+    if skip_completed and generation_marker_matches(sequence_output, config):
+        complete, detail = sequence_outputs_complete(
+            sequence_output, frame_ids, cameras, image_extension,
+            has_colmap=sequence_data.get("has_colmap", False),
+        )
+        if complete:
+            print("  Complete marker and outputs match; skipping sequence")
+            return True
+        print(f"  Completion marker is stale ({detail}); resuming sequence")
+
+    # A crash during this invocation must never leave an old marker claiming
+    # that a different or now-incomplete run is complete.
+    marker_path.unlink(missing_ok=True)
+
     lut_label = " + LUT on masked images" if lut_map else ""
     print(f"  Frames: {len(frame_ids)}, Cameras: {len(cameras)}{lut_label}")
 
@@ -720,11 +935,24 @@ def process_sequence(
     decode_start = time.time()
     success_count = 0
 
+    resumed_count = 0
+    cameras_to_decode = []
+    for camera_id in cameras:
+        if resume and camera_decode_outputs_complete(
+            sequence_output, camera_id, frame_ids, content_type, image_extension
+        ):
+            resumed_count += 1
+        else:
+            cameras_to_decode.append(camera_id)
+
+    if resumed_count:
+        print(f"  Resume: kept decoded/final outputs for {resumed_count}/{len(cameras)} cameras")
+
     if parallel > 1:
         # Parallel decoding
         with ThreadPoolExecutor(max_workers=parallel) as executor:
             futures = {}
-            for camera_id in cameras:
+            for camera_id in cameras_to_decode:
                 video_path = sequence_input / f"{sequence_name}_{camera_id}.mp4"
                 if not video_path.exists():
                     print(f"  Warning: Video not found: {video_path}", file=sys.stderr)
@@ -733,7 +961,7 @@ def process_sequence(
                 future = executor.submit(
                     decode_camera_video,
                     video_path, sequence_output, camera_id,
-                    frame_ids, content_type, image_extension, verbose
+                    frame_ids, content_type, image_extension, verbose, resume
                 )
                 futures[future] = camera_id
 
@@ -744,18 +972,18 @@ def process_sequence(
                     success_count += 1
     else:
         # Sequential decoding with progress
-        for i, camera_id in enumerate(cameras, 1):
+        for i, camera_id in enumerate(cameras_to_decode, 1):
             video_path = sequence_input / f"{sequence_name}_{camera_id}.mp4"
             if not video_path.exists():
                 print(f"  Warning: Video not found: {video_path}", file=sys.stderr)
                 continue
 
             if not verbose:
-                print(f"  Decoding camera {i}/{len(cameras)}: {camera_id}...", end=" ")
+                print(f"  Decoding camera {i}/{len(cameras_to_decode)}: {camera_id}...", end=" ")
                 sys.stdout.flush()
             success, duration = decode_camera_video(
                 video_path, sequence_output, camera_id,
-                frame_ids, content_type, image_extension, verbose
+                frame_ids, content_type, image_extension, verbose, resume
             )
             if success:
                 success_count += 1
@@ -763,7 +991,10 @@ def process_sequence(
                     print(f"{format_duration(duration)}")
 
     decode_time = time.time() - decode_start
-    print(f"  Decoded {success_count}/{len(cameras)} cameras in {format_duration(decode_time)}")
+    print(
+        f"  Prepared {success_count + resumed_count}/{len(cameras)} cameras "
+        f"({success_count} decoded, {resumed_count} resumed) in {format_duration(decode_time)}"
+    )
 
     # Copy colmap directory to per-frame sparse/0/ if present
     if sequence_data.get("has_colmap", False):
@@ -789,14 +1020,26 @@ def process_sequence(
     if not apply_masked_images(
         sequence_output, frame_ids, cameras, image_extension,
         lut_map=lut_map, verbose=verbose,
+        workers=lut_workers, resume=resume,
     ):
         return False
     print(f"  Created images for {len(frame_ids)} frames in "
           f"{format_duration(time.time() - mask_start)}")
 
-    cleanup_intermediate_outputs(sequence_output, frame_ids, verbose)
+    complete, detail = sequence_outputs_complete(
+        sequence_output, frame_ids, cameras, image_extension,
+        has_colmap=sequence_data.get("has_colmap", False),
+    )
+    if not complete:
+        print(f"  Error: sequence is incomplete ({detail})", file=sys.stderr)
+        print("  Keeping images_no_lut so --resume can continue later", file=sys.stderr)
+        return False
 
-    return success_count > 0
+    cleanup_intermediate_outputs(sequence_output, frame_ids, verbose)
+    write_generation_marker(sequence_output, config)
+    print(f"  Wrote completion marker: {sequence_output / GENERATION_MARKER}")
+
+    return True
 
 
 DOWN_SAMPLE_SCALES = (2, 4, 8)
@@ -1486,6 +1729,12 @@ def main():
                         help="Specific cameras to decode (default: all)")
     parser.add_argument("--parallel", "-j", type=int, default=1,
                         help="Parallel camera decoding (default: 1)")
+    parser.add_argument("--lut-workers", type=int, default=1,
+                        help="Parallel LUT/mask image workers (default: 1)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Resume unfinished work and skip valid existing images")
+    parser.add_argument("--skip-completed", action="store_true",
+                        help="Skip sequences with a matching completion marker (implies --resume)")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output")
     parser.add_argument("--apply-lut", nargs="?", const="auto", default="auto",
@@ -1532,6 +1781,12 @@ def main():
 
     if args.point_cloud_sampling_num is not None and args.point_cloud_sampling_num <= 0:
         print("Error: --point-cloud-sampling-num must be positive", file=sys.stderr)
+        sys.exit(1)
+    if args.parallel <= 0:
+        print("Error: --parallel must be positive", file=sys.stderr)
+        sys.exit(1)
+    if args.lut_workers <= 0:
+        print("Error: --lut-workers must be positive", file=sys.stderr)
         sys.exit(1)
     if args.foot_level <= 0.0 or args.foot_level > 1.0:
         print("Error: --foot-level must be in (0, 1]", file=sys.stderr)
@@ -1607,6 +1862,11 @@ def main():
             )
     if args.max_frames is not None:
         print(f"Max frames: {args.max_frames}")
+    if args.resume or args.skip_completed:
+        print(
+            f"Resume: enabled; LUT/mask workers: {args.lut_workers}; "
+            f"skip completed: {args.skip_completed}"
+        )
     print()
 
     # Process each sequence
@@ -1619,6 +1879,9 @@ def main():
             args.input, args.output, sequence_name, sequence_data,
             args.cameras, args.parallel, args.verbose, lut_map,
             args.max_frames,
+            lut_workers=args.lut_workers,
+            resume=args.resume or args.skip_completed,
+            skip_completed=args.skip_completed,
         ):
             success_count += 1
             successful_sequences.append(sequence_name)

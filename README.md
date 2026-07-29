@@ -165,6 +165,35 @@ python video_to_images.py --input s5 --output extracted/s5 --cameras 0028 1362
 python video_to_images.py --input s5 --output extracted/s5 --apply-lut
 ```
 
+### Resumable GSplat Generation
+
+`generate_gsplat_dataset.py` can parallelize the LUT/mask stage and safely
+continue an interrupted run. Resume with the same output directory so the
+generator can reuse decoded frames and finished RGBA images.
+
+```bash
+python generate_gsplat_dataset.py \
+  --input /scratch/$USER/DanceNet3D/s6 \
+  --output /scratch/$USER/PREPROCESSED_DATASETS_LUT_STAGING \
+  --sequences BiancaGolden_CircleTurns \
+  --max-frames 433 \
+  --apply-lut /scratch/$USER/DanceNet3D/color_lut \
+  --parallel 4 \
+  --lut-workers 8 \
+  --resume \
+  --skip-completed \
+  --skip-point-cloud-sampling \
+  --skip-downsample
+```
+
+- `--lut-workers N` processes up to `N` LUT/mask image pairs concurrently.
+- `--resume` validates and skips finished RGBA images, reuses decoded frames,
+  and only decodes cameras with missing work.
+- `--skip-completed` implies `--resume` and skips a sequence only when its
+  completion marker matches the frames, cameras, and LUT content.
+- Final images and completion markers are written atomically. Raw
+  `images_no_lut` files are retained when completeness validation fails.
+
 ### Extract Point Clouds
 
 **Prerequisites:** zstd, tar
